@@ -9,7 +9,7 @@ from atomic_features import AtomicFeatureExtractor
 DATA_PATH = "data/ontosync_v1_testset.jsonl"
 MODEL = "/home/skyhe666/llm-model/Qwen/Qwen3.5-9B"
 
-client = OpenAI(api_key="EMPTY", base_url="http://10.1.47.245:8000/v1/completions")
+client = OpenAI(api_key="EMPTY", base_url="http://10.1.47.245:8000/v1")
 
 
 def llm_call(messages):
@@ -17,9 +17,11 @@ def llm_call(messages):
         model=MODEL,
         messages=messages,
         temperature=0.0,
-        max_tokens=400,
+        max_tokens=2048,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
-    return resp.choices[0].message.content
+    msg = resp.choices[0].message
+    return (msg.content or "").strip()
 
 
 def load_jsonl(path):
@@ -35,58 +37,11 @@ def load_jsonl(path):
 def main():
     trajectories = load_jsonl(DATA_PATH)
 
-    memory_builder = IncidentMemoryBuilder()
+    memory_builder = IncidentMemoryBuilder(llm_call=llm_call)
     extractor = AtomicFeatureExtractor(llm_call=llm_call)
 
     all_step_results = []
 
-    for traj in trajectories:
-        traj_id = traj["trajectory_id"]
-        collapse_type = traj["collapse_type"]
-        label = traj["label"]
-
-        print("=" * 80)
-        print(f"Trajectory: {traj_id} | type={collapse_type} | label={label}")
-        print("=" * 80)
-
-        for step_idx, step in enumerate(traj["steps"]):
-            memory_state = memory_builder.build(traj, step_idx).to_dict()
-            result = extractor.extract_step(step, traj, memory_state).to_dict()
-
-            row = {
-                "trajectory_id": traj_id,
-                "collapse_type": collapse_type,
-                "label": label,
-                "step_index": step_idx + 1,
-                "step_label": step.get("step_label", 0),
-                "action_text": step["action_text"],
-                "memory_state": memory_state,
-                **result,
-            }
-            all_step_results.append(row)
-
-            print(f"\n--- Step {step_idx + 1} ---")
-            print("Action:", step["action_text"])
-            print("Memory:", json.dumps(memory_state, ensure_ascii=False))
-            print("Atomic:", json.dumps({
-                k: row[k] for k in [
-                    "role_boundary_stretch",
-                    "role_scope_mismatch",
-                    "direct_task_divergence",
-                    "incident_object_mismatch",
-                    "unsupported_by_observed_evidence",
-                    "evidence_gap",
-                    "unanchored_target_reference",
-                    "requires_scope_expansion",
-                ]
-            }, ensure_ascii=False))
-
-    # 保存逐步结果
-    with open("data/atomic_step_results.jsonl", "w", encoding="utf-8") as f:
-        for row in all_step_results:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    # 按 collapse_type 聚合
     feature_names = [
         "role_boundary_stretch",
         "role_scope_mismatch",
@@ -98,18 +53,83 @@ def main():
         "requires_scope_expansion",
     ]
 
+    for traj in trajectories:
+        traj_id = traj["trajectory_id"]
+        collapse_type = traj["collapse_type"]
+        label = traj["label"]
+
+        print("=" * 80)
+        print(f"Trajectory: {traj_id} | type={collapse_type} | label={label}")
+        print("=" * 80)
+
+        for step_idx, step in enumerate(traj["steps"]):
+            memory_obj = memory_builder.build(traj, step_idx)
+            memory_state = memory_obj.to_dict()
+
+            result = extractor.extract_step(step, traj, memory_state).to_dict()
+
+            row = {
+                "trajectory_id": traj_id,
+                "collapse_type": collapse_type,
+                "label": label,
+                "step_index": step_idx + 1,
+                "step_label": step.get("step_label", 0),
+                "action_text": step.get("action_text", ""),
+                "goal_text": step.get("goal_text", ""),
+                "evidence_text": step.get("evidence_text", ""),
+                "memory_state": memory_state,
+                **result,
+            }
+            all_step_results.append(row)
+
+            atomic_values = {k: row[k] for k in feature_names}
+
+            print(f"\n--- Step {step_idx + 1} ---")
+            print("Action:", step.get("action_text", ""))
+            print("Memory core:", memory_state.get("core_incident_objects", []))
+            print("Memory incident-anchored:", memory_state.get("incident_anchored_objects", []))
+            print("Memory historically-seen:", memory_state.get("historically_seen_objects", []))
+            print("Memory findings:", memory_state.get("observed_findings", [])[:5])
+            print("Atomic:", json.dumps(atomic_values, ensure_ascii=False))
+
+            if (
+                not memory_state.get("core_incident_objects")
+                and memory_state.get("raw_core_response")
+            ):
+                print("MEMORY CORE RAW:", memory_state["raw_core_response"][:800])
+
+            if (
+                step_idx > 0
+                and not memory_state.get("incident_anchored_objects")
+                and not memory_state.get("historically_seen_objects")
+                and not memory_state.get("observed_findings")
+                and memory_state.get("raw_history_response")
+            ):
+                print("MEMORY HISTORY RAW:", memory_state["raw_history_response"][:800])
+
+            if sum(atomic_values.values()) == 0 and row.get("raw_response"):
+                print("ATOMIC RAW RESPONSE:", row["raw_response"][:800])
+
+    with open("data/atomic_step_results.jsonl", "w", encoding="utf-8") as f:
+        for row in all_step_results:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
     grouped = defaultdict(list)
     for row in all_step_results:
-        grouped[row["collapse_type"]].append(row)
+        if row["collapse_type"] == "benign":
+            grouped["benign"].append(row)
+        else:
+            if row["step_label"] == 1:
+                grouped[row["collapse_type"]].append(row)
 
     print("\n" + "#" * 80)
-    print("Per-collapse_type feature means")
+    print("Per-collapse_type feature means (benign=all, malicious=post-deviation only)")
     print("#" * 80)
 
     summary = {}
     for ctype, rows in grouped.items():
         summary[ctype] = {}
-        print(f"\n[{ctype}]")
+        print(f"\n[{ctype}]  n={len(rows)}")
         for feat in feature_names:
             val = mean(r[feat] for r in rows) if rows else 0.0
             summary[ctype][feat] = val
@@ -118,9 +138,33 @@ def main():
     with open("data/atomic_feature_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
+    binary_grouped = {"benign": [], "malicious_post": []}
+    for row in all_step_results:
+        if row["collapse_type"] == "benign":
+            binary_grouped["benign"].append(row)
+        elif row["step_label"] == 1:
+            binary_grouped["malicious_post"].append(row)
+
+    print("\n" + "#" * 80)
+    print("Benign vs Malicious-Post feature means")
+    print("#" * 80)
+
+    binary_summary = {}
+    for gname, rows in binary_grouped.items():
+        binary_summary[gname] = {}
+        print(f"\n[{gname}]  n={len(rows)}")
+        for feat in feature_names:
+            val = mean(r[feat] for r in rows) if rows else 0.0
+            binary_summary[gname][feat] = val
+            print(f"{feat:35s}: {val:.3f}")
+
+    with open("data/atomic_feature_binary_summary.json", "w", encoding="utf-8") as f:
+        json.dump(binary_summary, f, ensure_ascii=False, indent=2)
+
     print("\nSaved:")
     print("- data/atomic_step_results.jsonl")
     print("- data/atomic_feature_summary.json")
+    print("- data/atomic_feature_binary_summary.json")
 
 
 if __name__ == "__main__":
