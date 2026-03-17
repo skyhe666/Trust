@@ -7,9 +7,9 @@ from memory_builder import IncidentMemoryBuilder
 from atomic_features import AtomicFeatureExtractor
 
 DATA_PATH = "data/ontosync_v1_testset.jsonl"
-MODEL = "/home/skyhe666/models/Qwen/Qwen3-4B-Instruct-2507/"
+MODEL = "/home/skyhe666/llm-model/Qwen/Qwen3.5-9B"
 
-client = OpenAI(api_key="EMPTY", base_url="http://100.98.48.49:8000/v1")
+client = OpenAI(api_key="EMPTY", base_url="http://10.1.47.245:8000/v1/completions")
 
 
 def llm_call(messages):
