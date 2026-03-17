@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import re
+import json
 from dataclasses import dataclass, asdict, field
-from typing import Any, Dict, List, Set
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass
@@ -10,6 +10,7 @@ class IncidentMemoryState:
     core_incident_objects: List[str] = field(default_factory=list)
     anchored_objects: List[str] = field(default_factory=list)
     observed_findings: List[str] = field(default_factory=list)
+    raw_response: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -17,110 +18,144 @@ class IncidentMemoryState:
 
 class IncidentMemoryBuilder:
     """
-    Minimal memory builder.
+    Pure-LLM memory builder.
 
-    Uses only:
+    For step t, it uses only:
       - task_text
-      - steps[:current_step_index]
+      - steps[:t]
 
-    Does NOT read future steps.
+    It does NOT read future steps.
+    It does NOT treat action text as evidence.
     """
 
-    OBJECT_PATTERNS = [
-        r"\bbattery pack [a-z]\d+\b",
-        r"\bpack [a-z]\d+\b",
-        r"\bcell [a-z]\d+(?:-\d+)?\b",
-        r"\binv-\d+\b",
-        r"\binverter [a-z]+-\d+\b",
-        r"\bcb-\d+\b",
-        r"\bcombiner box\b",
-        r"\bpv array\b",
-        r"\bcooling fan\b",
-        r"\bair filter\b",
-        r"\bjunction terminals?\b",
-        r"\bcommunication panel\b",
-        r"\bethernet cable\b",
-        r"\bethernet switch\b",
-        r"\bdc bus\b",
-        r"\bcontroller\b",
-        r"\bcontrol board\b",
-        r"\bfirmware\b",
-        r"\bgrid operator\b",
-        r"\bgrid connection point\b",
-        r"\bess\b",
-        r"\bscada\b",
-        r"\bvlan \d+\b",
-        r"\bport [a-z]+\d+/\d+/\d+\b",
-        r"\bmodbus\b",
-    ]
+    def __init__(self, llm_call: Callable[[List[Dict[str, str]]], str]) -> None:
+        self.llm_call = llm_call
 
     def build(self, trajectory: Dict[str, Any], current_step_index: int) -> IncidentMemoryState:
         task_text = trajectory.get("task_text", "")
         steps = trajectory.get("steps", [])
         history_steps = steps[:current_step_index]
 
-        core_incident_objects = self._extract_objects(task_text)
+        history_text = self._format_history(history_steps)
 
-        anchored_objects: List[str] = []
-        anchored_seen: Set[str] = set()
+        system_prompt = (
+            "You are a strict incident-memory builder.\n"
+            "Your job is to summarize the already-established incident context BEFORE the current step.\n"
+            "You must only use the task text and historical steps provided.\n"
+            "Do NOT read future information.\n"
+            "Do NOT infer hidden facts.\n"
+            "Do NOT treat actions, goals, or hypotheses as evidence.\n"
+            "Only observation_text and evidence_text can anchor objects or findings.\n"
+            "Return strict JSON only.\n"
+        )
 
-        observed_findings: List[str] = []
-        finding_seen: Set[str] = set()
+        user_prompt = f"""
+TASK:
+{task_text}
 
+HISTORICAL STEPS BEFORE CURRENT STEP:
+{history_text}
+
+Build a lightweight memory state with exactly these fields:
+
+1. core_incident_objects:
+   The main incident objects explicitly defined by the task.
+   Keep this list small and stable.
+   Do NOT include every mentioned object.
+   Prefer the primary device/component/problem target from the task.
+
+2. anchored_objects:
+   Objects that have already appeared in historical observation_text or evidence_text.
+   Do NOT include objects that appear only in action_text or goal_text.
+   Do NOT include speculative or hypothetical targets.
+
+3. observed_findings:
+   Short factual findings already established by historical observation_text or evidence_text.
+   Each finding should be short, concrete, and evidence-grounded.
+   Do NOT include future outcomes.
+   Do NOT include inferred diagnoses unless explicitly observed/evidenced.
+
+Important rules:
+- If history is empty, anchored_objects and observed_findings should be empty lists.
+- Keep each list concise.
+- Remove duplicates.
+- Normalize wording where reasonable.
+- Return strict JSON only.
+
+Return exactly this schema:
+{{
+  "core_incident_objects": ["..."],
+  "anchored_objects": ["..."],
+  "observed_findings": ["..."]
+}}
+""".strip()
+
+        raw = self.llm_call([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ])
+
+        parsed = self._parse_json(raw)
+        if parsed is None:
+            return IncidentMemoryState(raw_response=raw)
+
+        return IncidentMemoryState(
+            core_incident_objects=self._clean_list(parsed.get("core_incident_objects", [])),
+            anchored_objects=self._clean_list(parsed.get("anchored_objects", [])),
+            observed_findings=self._clean_list(parsed.get("observed_findings", [])),
+            raw_response=raw,
+        )
+
+    def _format_history(self, history_steps: List[Dict[str, Any]]) -> str:
+        if not history_steps:
+            return "(none)"
+
+        chunks: List[str] = []
         for step in history_steps:
+            idx = step.get("step_index", "?")
             observation_text = step.get("observation_text", "")
             evidence_text = step.get("evidence_text", "")
 
-            # anchored_objects only from historical observation/evidence
-            hist_text = f"{observation_text} {evidence_text}"
-            for obj in self._extract_objects(hist_text):
-                if obj not in anchored_seen:
-                    anchored_seen.add(obj)
-                    anchored_objects.append(obj)
+            chunks.append(
+                f"Step {idx}:\n"
+                f"  Observation: {observation_text}\n"
+                f"  Evidence: {evidence_text}"
+            )
+        return "\n\n".join(chunks)
 
-            for finding in self._extract_findings(observation_text, evidence_text):
-                if finding not in finding_seen:
-                    finding_seen.add(finding)
-                    observed_findings.append(finding)
+    def _parse_json(self, raw: str) -> Optional[Dict[str, Any]]:
+        if not raw:
+            return None
 
-        return IncidentMemoryState(
-            core_incident_objects=core_incident_objects,
-            anchored_objects=anchored_objects,
-            observed_findings=observed_findings,
-        )
+        text = raw.strip()
 
-    def _normalize(self, text: str) -> str:
-        text = text.lower().strip()
-        text = re.sub(r"\s+", " ", text)
-        return text
+        if "```json" in text:
+            text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+        elif "```" in text:
+            text = text.split("```", 1)[1].split("```", 1)[0].strip()
 
-    def _extract_objects(self, text: str) -> List[str]:
-        text = self._normalize(text)
-        found: List[str] = []
-        seen: Set[str] = set()
+        try:
+            return json.loads(text)
+        except Exception:
+            return None
 
-        for pattern in self.OBJECT_PATTERNS:
-            for match in re.finditer(pattern, text):
-                obj = match.group(0).strip()
-                if obj not in seen:
-                    seen.add(obj)
-                    found.append(obj)
+    def _clean_list(self, value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
 
-        return found
+        out: List[str] = []
+        seen = set()
 
-    def _extract_findings(self, observation_text: str, evidence_text: str) -> List[str]:
-        """
-        Keep this very lightweight and deterministic.
-        We store short normalized findings from historical observation/evidence.
-        """
-        text = self._normalize(f"{observation_text}. {evidence_text}")
-        sentences = [s.strip() for s in re.split(r"[.;]", text) if s.strip()]
-
-        findings: List[str] = []
-        for s in sentences:
-            # only keep moderately informative sentences
-            if len(s) < 12:
+        for item in value:
+            if not isinstance(item, str):
                 continue
-            findings.append(s[:160])
+            s = " ".join(item.strip().split())
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
 
-        return findings[:4]  # keep small, lightweight
+        return out
