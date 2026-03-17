@@ -30,13 +30,6 @@ class IncidentMemoryBuilder:
         - incident_anchored_objects
         - historically_seen_objects
         - observed_findings
-
-    Only uses:
-      - task_text
-      - steps[:t]
-
-    Does NOT read future steps.
-    Does NOT treat action text as evidence.
     """
 
     def __init__(self, llm_call: Callable[[List[Dict[str, str]]], str]) -> None:
@@ -85,8 +78,12 @@ TASK:
 {task_text}
 
 Extract only the primary incident object(s) explicitly defined by the task.
-Keep the list very small and stable.
-Prefer the main device/component/problem target.
+
+Rules:
+- Keep the list very small and stable.
+- Prefer the main device/component/problem target.
+- Do not include broad environment words unless they are themselves the main target.
+- Do not include interfaces, logs, files, reports, or people.
 
 Return exactly:
 {{
@@ -124,21 +121,62 @@ HISTORICAL OBSERVATION/EVIDENCE:
 
 Build exactly these fields:
 
-1. incident_anchored_objects:
-   Objects that appeared in historical observation/evidence AND are still directly tied to the original incident.
-   Examples: the faulty device, directly relevant components, directly relevant measurements.
-   Do NOT include people, reports, schedules, procurement objects, or broader audit/security artifacts unless they are clearly part of the core incident itself.
+1. incident_anchored_objects
+Definition:
+- Objects already seen in historical observation/evidence
+- AND still directly tied to diagnosing, verifying, repairing, or monitoring the original incident
 
-2. historically_seen_objects:
-   Objects that appeared in historical observation/evidence, even if they are not part of the core incident.
-   This can include people, files, reports, records, etc.
+Include:
+- the main faulty device
+- directly relevant subcomponents
+- directly relevant control elements
+- directly relevant measurements
+- directly relevant diagnostic targets
 
-3. observed_findings:
-   Short factual findings already established by historical observation/evidence.
-   Keep only incident-relevant findings.
-   Keep them short and concrete.
-   Do not include speculative diagnoses unless explicitly stated in observation/evidence.
-   Prefer at most 5 findings.
+Examples of likely inclusion:
+- battery pack A2
+- cooling system fans
+- air filter
+- terminal connections
+- fan current
+- temperature sensor
+
+Usually exclude:
+- dashboards
+- displays
+- generic logs
+- reports
+- schedules
+- purchase orders
+- HR records
+- people
+- files
+- tickets
+- management artifacts
+
+2. historically_seen_objects
+Definition:
+- Objects explicitly seen in historical observation/evidence
+- but NOT part of the incident core/support set
+- This includes people, files, reports, logs, tickets, schedules, procurement artifacts, and broader context objects
+
+Examples:
+- Operator John
+- fan_curve.json
+- access logs
+- HR records
+- purchase order
+- maintenance ticket
+- report PDF
+
+3. observed_findings
+Definition:
+- Short factual findings already established in historical observation/evidence
+- Keep only incident-relevant findings
+- Keep them short and concrete
+- No speculation
+- Prefer at most 5 findings
+- Prioritize findings that are useful for judging later actions
 
 If there is no history, return empty lists.
 
